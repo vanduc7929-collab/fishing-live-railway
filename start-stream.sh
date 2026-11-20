@@ -2,6 +2,9 @@
 set -u
 
 APP_PORT="${PORT:-3000}"
+TTS_ENGINE_PORT="${TTS_ENGINE_PORT:-3998}"
+TTS_PROXY_PORT="${TTS_PROXY_PORT:-3999}"
+TTS_ENGINE="${TTS_ENGINE:-edge}"
 STREAM_WIDTH="${STREAM_WIDTH:-720}"
 STREAM_HEIGHT="${STREAM_HEIGHT:-1280}"
 STREAM_FPS="${STREAM_FPS:-30}"
@@ -97,10 +100,56 @@ if [ -z "$TARGET_RTMP" ]; then
   exit 0
 fi
 
+# 2. Start natural Vietnamese AI TTS sidecars (Edge Neural TTS + local proxy with Google TTS fallback)
+TTS_LOWER="$(printf '%s' "${TTS_ENABLED:-true}" | tr '[:upper:]' '[:lower:]')"
+ENGINE_LOWER="$(printf '%s' "${TTS_ENGINE}" | tr '[:upper:]' '[:lower:]')"
+
+if [ "$TTS_LOWER" != "false" ] && [ "$ENGINE_LOWER" != "google" ]; then
+  run_tts_engine() {
+    while [ "$STOPPING" -eq 0 ]; do
+      python3 /app/tts-engine.py
+      code=$?
+      if [ "$STOPPING" -ne 0 ]; then break; fi
+      echo "[tts-engine] Dừng với mã ${code}, khởi động lại sau 2s..."
+      sleep 2
+    done
+  }
+  run_tts_engine &
+  PIDS+=("$!")
+
+  for _ in $(seq 1 15); do
+    if curl -sf "http://127.0.0.1:${TTS_ENGINE_PORT}/health" >/dev/null 2>&1; then
+      break
+    fi
+    sleep 0.5
+  done
+fi
+
+run_tts_proxy() {
+  while [ "$STOPPING" -eq 0 ]; do
+    node /app/tts-proxy.js
+    code=$?
+    if [ "$STOPPING" -ne 0 ]; then break; fi
+    echo "[tts-proxy] Dừng với mã ${code}, khởi động lại sau 2s..."
+    sleep 2
+  done
+}
+run_tts_proxy &
+PIDS+=("$!")
+
+PROXY_READY=0
+for _ in $(seq 1 15); do
+  if curl -sf "http://127.0.0.1:${TTS_PROXY_PORT}/__tts-shim.js" >/dev/null 2>&1; then
+    PROXY_READY=1
+    break
+  fi
+  sleep 0.5
+done
+
 echo "[stream] Chuẩn bị phát live 24/7 (${STREAM_WIDTH}x${STREAM_HEIGHT} @ ${STREAM_FPS}fps, video=${VIDEO_BITRATE}, audio=${AUDIO_BITRATE})"
 echo "[stream] Đích RTMP: $(mask_rtmp "$TARGET_RTMP")"
 
-# 2. Start virtual X11 display (Xvfb) + lightweight window manager (Openbox)
+# 3. Start virtual X11 display (Xvfb) + lightweight window manager (Openbox)
 rm -f /tmp/.X99-lock /tmp/.X11-unix/X99 2>/dev/null || true
 Xvfb "$DISPLAY" -screen 0 "${STREAM_WIDTH}x${STREAM_HEIGHT}x24" -ac +extension GLX +render -noreset &
 XVFB_PID=$!
@@ -118,7 +167,7 @@ OPENBOX_PID=$!
 PIDS+=("$OPENBOX_PID")
 sleep 1
 
-# 3. Start D-Bus session + PulseAudio pure virtual speaker sink (captures game SFX, music, and TTS)
+# 4. Start D-Bus session + PulseAudio pure virtual speaker sink (captures game SFX, music, and AI TTS)
 export XDG_RUNTIME_DIR="/tmp/runtime-streamer"
 mkdir -p "$XDG_RUNTIME_DIR"
 chmod 700 "$XDG_RUNTIME_DIR"
@@ -147,13 +196,12 @@ done
 
 pactl set-default-sink virtual_speaker >/dev/null 2>&1 || true
 
-# Optional: start speech-dispatcher for Web Speech API TTS if enabled
-if [ "$(printf '%s' "${TTS_ENABLED:-true}" | tr '[:upper:]' '[:lower:]')" != "false" ]; then
-  speech-dispatcher -d >/dev/null 2>&1 || true
+# 5. Launch Chromium in kiosk mode pointing through local AI TTS proxy (with auto-restart)
+if [ "$PROXY_READY" -eq 1 ]; then
+  GAME_URL="http://127.0.0.1:${TTS_PROXY_PORT}/?${STREAM_URL_QUERY}"
+else
+  GAME_URL="http://127.0.0.1:${APP_PORT}/?${STREAM_URL_QUERY}"
 fi
-
-# 4. Launch Chromium in kiosk mode pointing to original game page (with auto-restart)
-GAME_URL="http://127.0.0.1:${APP_PORT}/?${STREAM_URL_QUERY}"
 echo "[stream] Mở trình duyệt hiển thị game: ${GAME_URL}"
 
 run_chromium() {
@@ -179,7 +227,6 @@ run_chromium() {
       --disable-sync \
       --disable-extensions \
       --disable-features=TranslateUI,MediaRouter,DialMediaRouteProvider \
-      --enable-speech-dispatcher \
       --user-data-dir=/tmp/chrome-profile \
       --window-position=0,0 \
       --window-size="${STREAM_WIDTH},${STREAM_HEIGHT}" \
@@ -210,7 +257,7 @@ PIDS+=("$CHROME_SUP_PID")
 # Give Chromium time to render initial pond and unlock audio
 sleep 6
 
-# 5. Start FFmpeg 24/7 RTMP streamer with automatic reconnect
+# 6. Start FFmpeg 24/7 RTMP streamer with automatic reconnect
 GOP_SIZE=$((STREAM_FPS * 2))
 
 while [ "$STOPPING" -eq 0 ]; do

@@ -2,7 +2,7 @@ FROM node:20-bookworm-slim
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Install Chromium, FFmpeg, Xvfb, Openbox, PulseAudio, Vietnamese fonts & Emoji, optional TTS
+# Install Chromium, FFmpeg, Xvfb, Openbox, PulseAudio, Vietnamese fonts & Emoji, Python for Edge Neural TTS
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
@@ -17,14 +17,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     dbus \
     dbus-x11 \
     chromium \
-    speech-dispatcher \
-    espeak-ng \
-    speech-dispatcher-espeak-ng \
+    python3 \
+    python3-pip \
     fontconfig \
     fonts-roboto \
     fonts-noto-color-emoji \
     fonts-dejavu-core \
     fonts-liberation \
+    && pip3 install --no-cache-dir --break-system-packages "edge-tts>=7.3.0" \
     && fc-cache -fv \
     && rm -rf /var/lib/apt/lists/*
 
@@ -37,20 +37,13 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev || npm install --omit=dev
 
-# Copy original repository files untouched + streaming wrapper files
+# Copy original repository files untouched + streaming & AI TTS wrapper files
 COPY . .
 
-# Ensure Unix LF line endings, executable entrypoint, and ownership for server.js writes (.env, tracks/, gifts.json)
-RUN sed -i 's/\r$//' /app/start-stream.sh \
-    && chmod +x /app/start-stream.sh \
-    && chown -R streamer:streamer /app
-
-# Configure speech-dispatcher to output via PulseAudio + espeak-ng (optional Vietnamese TTS)
-RUN mkdir -p /home/streamer/.config/speech-dispatcher \
-    && cp /etc/speech-dispatcher/speechd.conf /home/streamer/.config/speech-dispatcher/speechd.conf \
-    && sed -i 's/^#\s*AudioOutputMethod.*/AudioOutputMethod "pulse"/' /home/streamer/.config/speech-dispatcher/speechd.conf \
-    && sed -i 's/^#\s*DefaultModule.*/DefaultModule espeak-ng/' /home/streamer/.config/speech-dispatcher/speechd.conf \
-    && chown -R streamer:streamer /home/streamer
+# Ensure Unix LF line endings, executable permissions, and ownership for server.js writes (.env, tracks/, gifts.json)
+RUN sed -i 's/\r$//' /app/start-stream.sh /app/tts-engine.py /app/tts-proxy.js \
+    && chmod +x /app/start-stream.sh /app/tts-engine.py /app/tts-proxy.js \
+    && chown -R streamer:streamer /app /home/streamer
 
 USER streamer
 
@@ -62,7 +55,12 @@ ENV DISPLAY=:99 \
     VIDEO_BUFSIZE=5000k \
     AUDIO_BITRATE=128k \
     X264_PRESET=veryfast \
-    STREAM_URL_QUERY=mock=0
+    STREAM_URL_QUERY=mock=0 \
+    TTS_ENGINE=edge \
+    TTS_VOICE=vi-VN-HoaiMyNeural \
+    TTS_RATE=+5% \
+    TTS_ENGINE_PORT=3998 \
+    TTS_PROXY_PORT=3999
 
 EXPOSE 3000
 
